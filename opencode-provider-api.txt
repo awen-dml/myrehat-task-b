@@ -1,0 +1,196 @@
+ * 3. `baseUrl` — `OpenCode.make({baseUrl, ...clientOptions})`.
+ * 4. service discovery — `Service.discover()` (or `Service.ensure()` when
+ *    `autoStart` is true) using `service` options; endpoint auth headers are
+ *    merged under user headers automatically.
+ *
+ * v4's `hostname`/`port`/`serverTimeout` probing has no v2 equivalent and
+ * was removed (v5 break).
+ */
+interface OpencodeProviderSettings {
+    /**
+     * Preconfigured OpenCode v2 client. When provided, backend management is
+     * bypassed and `clientManager`/`baseUrl`/`service`/`autoStart`/
+     * `clientOptions` are ignored.
+     */
+    client?: OpencodeClient;
+    /**
+     * Caller-supplied client manager (retyped v4 injection seam). Used as-is:
+     * the provider never disposes it — `provider.dispose()` is a no-op for
+     * injected managers.
+     */
+    clientManager?: OpencodeClientManager;
+    /**
+     * Base URL of an OpenCode v2 server. Takes precedence over service
+     * discovery.
+     */
+    baseUrl?: string;
+    /**
+     * Local-service discovery options (registration file, version predicate,
+     * spawn command) for the service backend.
+     */
+    service?: OpencodeServiceOptions;
+    /**
+     * Start the local service via `Service.ensure` when discovery finds none
+     * (default command `opencode serve --service`; needs an OpenCode 2.x
+     * `opencode` binary on PATH, or `service.command`). Off by default: it
+     * spawns a long-lived background service that outlives this process
+     * unless the provider owns it (see `dispose`).
+     * @default false
+     */
+    autoStart?: boolean;
+    /**
+     * Client construction passthrough (`fetch`, `headers`) for the `baseUrl`
+     * and service backends. Ignored when `client` is provided.
+     */
+    clientOptions?: OpencodeClientOptions;
+    /**
+     * Default settings applied to all model instances.
+     * Can be overridden per-model.
+     */
+    defaultSettings?: OpencodeSettings;
+}
+/**
+ * Provider interface for OpenCode.
+ */
+interface OpencodeProvider extends ProviderV4 {
+    /**
+     * Create a language model instance.
+     * @param modelId - Model ID in format "providerID/modelID" or "modelID"
+     * @param settings - Optional settings for this model instance
+     */
+    (modelId: OpencodeModelId, settings?: OpencodeSettings): LanguageModelV4;
+    /**
+     * Create a language model instance.
+     * @param modelId - Model ID in format "providerID/modelID" or "modelID"
+     * @param settings - Optional settings for this model instance
+     */
+    languageModel(modelId: OpencodeModelId, settings?: OpencodeSettings): LanguageModelV4;
+    /**
+     * Alias for languageModel().
+     * @param modelId - Model ID in format "providerID/modelID" or "modelID"
+     * @param settings - Optional settings for this model instance
+     */
+    chat(modelId: OpencodeModelId, settings?: OpencodeSettings): LanguageModelV4;
+    /**
+     * The client manager backing this provider (advanced usage: server URL,
+     * explicit `stopService()`).
+     */
+    getClientManager(): OpencodeClientManager;
+    /**
+     * Dispose provider-owned resources (embedded host, event subscriptions).
+     * Never stops a shared registered service, never closes caller-supplied
+     * clients, and never disposes an injected `clientManager`.
+     */
+    dispose(): Promise<void>;
+}
+/**
+ * Parsed model ID containing provider and model components.
+ */
+interface ParsedModelId {
+    providerID: string;
+    modelID: string;
+}
+/**
+ * Per-request provider options for `providerOptions.opencode`.
+ */
+interface OpencodeProviderOptions {
+    /**
+     * User message ID to send as `SessionPromptInput.id` for this request.
+     * No format is asserted; current dev builds still constrain caller-supplied
+     * IDs to a `msg_` prefix server-side.
+     */
+    id?: string;
+    /**
+     * Escape hatch: target this existing session for this call instead of the
+     * model instance's pinned session (caller manages session lifecycle and
+     * exclusivity).
+     */
+    sessionId?: string;
+}
+/**
+ * Native OpenCode assistant finish value.
+ */
+type OpencodeFinish = NonNullable<SessionMessageAssistant["finish"]>;
+/**
+ * Metadata returned in provider responses under `providerMetadata.opencode`.
+ */
+interface OpencodeProviderMetadata {
+    opencode: {
+        /** Session the generation ran on. */
+        sessionId: string;
+        /** Assistant message ID (last message of the turn on multi-step turns). */
+        messageId?: string;
+        /** Inbox receipt ID returned by `session.prompt`. */
+        inboxId?: string;
+        /** First pending tool-approval request ID, when the turn is blocked. */
+        approvalRequestId?: string;
+        /** Every pending tool-approval request ID, when the turn is blocked. */
+        approvalRequestIds?: string[];
+        /** Approval request IDs replied during this turn (phase-2 calls). */
+        repliedApprovalIds?: string[];
+        /** Form IDs surfaced (and answered/cancelled) during this turn. */
+        formIds?: string[];
+        /** Native finish value before AI SDK normalization. */
+        finish?: OpencodeFinish;
+        /** Provider-raw finish string, when the server reports one. */
+        rawFinish?: string;
+        /** Execution outcome for the turn. */
+        outcome?: "succeeded" | "failed" | "interrupted";
+        /** Interrupt reason when the turn was interrupted. */
+        interruptReason?: "user" | "shutdown" | "superseded" | "inactivity";
+        /** Cost in USD, summed across the turn's steps when available. */
+        cost?: number;
+        /** Native token usage, summed across the turn's steps. */
+        tokens?: TokenUsageInfo;
+        /** Structured error reported for a failed turn/step. */
+        error?: SessionStructuredError;
+        /** Retry record when the server retried the turn. */
+        retry?: SessionMessageAssistantRetry;
+    };
+}
+
+/**
+ * Create an OpenCode provider.
+ *
+ * Model instances are NOT cached: every call to the provider (or
+ * `languageModel`/`chat`) returns a fresh `OpencodeLanguageModel`. One model
+ * instance = one conversation = one pinned OpenCode session — reuse the same
+ * instance for every call in a conversation (tool-approval continuation
+ * calls must reattach to the instance's blocked session), and create a new
+ * instance for a new conversation. `providerOptions.opencode.sessionId` is
+ * the per-call escape hatch for callers managing sessions themselves.
+ *
+ * @param options - Provider settings (backend selection, defaults)
+ * @returns OpenCode provider instance
+ *
+ * @example
+ * ```ts
+ * import { createOpencode } from 'ai-sdk-provider-opencode-sdk';
+ *
+ * // Explicit server URL
+ * const opencode = createOpencode({ baseUrl: 'http://localhost:4096' });
+ * const model = opencode('anthropic/claude-opus-4-5-20251101');
+ *
+ * // Or local-service discovery with defaults
+ * const opencode = createOpencode({
+ *   service: { file: '/path/to/registration.json' },
+ *   defaultSettings: { agent: 'build' },
+ * });
+ * ```
+ */
+declare function createOpencode(options?: OpencodeProviderSettings): OpencodeProvider;
+/**
+ * Default OpenCode provider instance (local-service discovery backend).
+ *
+ * @example
+ * ```ts
+ * import { opencode } from 'ai-sdk-provider-opencode-sdk';
+ *
+ * const model = opencode('anthropic/claude-opus-4-5-20251101');
+ * ```
+ */
+declare const opencode: OpencodeProvider;
+/**
+ * Common model shortcuts for convenience.
+ *
+ * Every ID below is an OpenCode zen free-tier model, cross-checked two ways
